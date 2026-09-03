@@ -5,6 +5,7 @@ import type log from 'loglevel';
 import type { BulbSysinfo } from '../bulb';
 import type { default as Client, SendOptions } from '../client'; // eslint-disable-line import/no-named-default
 import type { Logger } from '../logger';
+import KlapConnection from '../network/klap-connection';
 import TcpConnection from '../network/tcp-connection';
 import UdpConnection from '../network/udp-connection';
 import type { PlugSysinfo } from '../plug';
@@ -140,6 +141,8 @@ abstract class Device extends EventEmitter {
 
   private readonly tcpConnection: TcpConnection;
 
+  private readonly klapConnection: KlapConnection;
+
   protected _sysInfo: Sysinfo;
 
   abstract readonly apiModules: ApiModuleNamespace;
@@ -195,6 +198,13 @@ abstract class Device extends EventEmitter {
       this.port,
       this.log,
       this.client,
+    );
+
+    this.klapConnection = new KlapConnection(
+      this.host,
+      this.port,
+      this.log,
+      this.client.credentials,
     );
   }
 
@@ -323,6 +333,7 @@ abstract class Device extends EventEmitter {
   closeConnection(): void {
     this.udpConnection.close();
     this.tcpConnection.close();
+    this.klapConnection.close();
   }
 
   /**
@@ -347,6 +358,14 @@ abstract class Device extends EventEmitter {
 
       if (thisSendOptions.transport === 'udp') {
         return await this.udpConnection.send(
+          payloadString,
+          this.port,
+          this.host,
+          thisSendOptions,
+        );
+      }
+      if (thisSendOptions.transport === 'klap') {
+        return await this.klapConnection.send(
           payloadString,
           this.port,
           this.host,

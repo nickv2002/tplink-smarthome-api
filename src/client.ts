@@ -9,6 +9,17 @@ import type { MarkOptional } from 'ts-essentials';
 import Bulb from './bulb';
 import Device, { isBulbSysinfo, isPlugSysinfo, type Sysinfo } from './device';
 import createLogger, { type Logger } from './logger';
+import type { Credentials } from './network/klap';
+import KlapConnection from './network/klap-connection';
+import {
+  createNewDiscoveryQuery,
+  DISCOVERY_PORT_2,
+  DISCOVERY_PORT_3,
+  getKlapHttpPort,
+  isIotKlapDiscovery,
+  isNewDiscoveryPort,
+  parseNewDiscoveryMessage,
+} from './network/klap-discovery';
 import TcpConnection from './network/tcp-connection';
 import UdpConnection from './network/udp-connection';
 import Plug, { hasSysinfoChildren } from './plug';
@@ -73,6 +84,16 @@ export interface ClientConstructorOptions {
    * \}
    */
   defaultSendOptions?: SendOptions;
+  /**
+   * TP-Link cloud account email. Required for IOT devices that moved to KLAP
+   * (e.g. KL125 firmware 1.1.1).
+   */
+  username?: string;
+  /**
+   * TP-Link cloud account password. Required for IOT devices that moved to KLAP
+   * (e.g. KL125 firmware 1.1.1).
+   */
+  password?: string;
   /**
    * @defaultValue 'warn'
    */
@@ -148,13 +169,13 @@ export interface DiscoveryOptions {
  * Send Options.
  *
  * @typeParam timeout - (ms)
- * @typeParam transport - 'tcp','udp'
+ * @typeParam transport - 'tcp','udp','klap'
  * @typeParam useSharedSocket - attempt to reuse a shared socket if available, UDP only
  * @typeParam sharedSocketTimeout - (ms) how long to wait for another send before closing a shared socket. 0 = never automatically close socket
  */
 export type SendOptions = {
   timeout?: number;
-  transport?: 'tcp' | 'udp';
+  transport?: 'tcp' | 'udp' | 'klap';
   useSharedSocket?: boolean;
   sharedSocketTimeout?: number;
 };
@@ -242,6 +263,8 @@ class Client extends EventEmitter {
 
   log: Logger;
 
+  credentials: Credentials;
+
   devices: Map<string, AnyDeviceDiscovery> = new Map();
 
   discoveryTimer: NodeJS.Timeout | null = null;
@@ -254,14 +277,24 @@ class Client extends EventEmitter {
 
   isSocketBound = false;
 
+  private pendingKlapHosts = new Set<string>();
+
   constructor(options: ClientConstructorOptions = {}) {
     super();
-    const { defaultSendOptions, logLevel = 'warn', logger } = options;
+    const {
+      defaultSendOptions,
+      logLevel = 'warn',
+      logger,
+      username = '',
+      password = '',
+    } = options;
 
     this.defaultSendOptions = {
       ...this.defaultSendOptions,
       ...defaultSendOptions,
     };
+
+    this.credentials = { username, password };
 
     this.log = createLogger({ logger, level: logLevel });
   }
@@ -314,6 +347,23 @@ class Client extends EventEmitter {
       ? JSON.stringify(payload)
       : payload;
 
+    if (thisSendOptions.transport === 'klap') {
+      const connection = new KlapConnection(
+        host,
+        port,
+        this.log,
+        this.credentials,
+      );
+      const response = await connection.send(
+        payloadString,
+        port,
+        host,
+        thisSendOptions,
+      );
+      connection.close();
+      return response;
+    }
+
     let connection: UdpConnection | TcpConnection;
 
     if (thisSendOptions.transport === 'udp') {
@@ -334,6 +384,9 @@ class Client extends EventEmitter {
   /**
    * Requests `{system:{get_sysinfo:{}}}` from device.
    *
+   * Tries the legacy XOR protocol first. If that fails (typical after
+   * firmware that closed TCP 9999), retries over KLAP HTTP.
+   *
    * @returns parsed JSON response
    * @throws {@link ResponseError}
    * @throws Error
@@ -344,19 +397,81 @@ class Client extends EventEmitter {
     sendOptions?: SendOptions,
   ): Promise<Sysinfo> {
     this.log.debug('client.getSysInfo(%j)', { host, port, sendOptions });
-    const response = await this.send(
-      '{"system":{"get_sysinfo":{}}}',
+    const { sysInfo } = await this.getSysInfoWithTransport(
       host,
       port,
       sendOptions,
     );
+    return sysInfo;
+  }
 
-    const responseObj: unknown = JSON.parse(response);
-    if (isSysinfoResponse(responseObj)) {
-      return responseObj.system.get_sysinfo;
+  /**
+   * @internal
+   */
+  async getSysInfoWithTransport(
+    host: string,
+    port = 9999,
+    sendOptions?: SendOptions,
+  ): Promise<{
+    sysInfo: Sysinfo;
+    transport: Required<SendOptions>['transport'];
+  }> {
+    const thisSendOptions = {
+      ...this.defaultSendOptions,
+      ...sendOptions,
+    };
+
+    const parseSysInfo = (response: string): Sysinfo => {
+      const responseObj: unknown = JSON.parse(response);
+      if (isSysinfoResponse(responseObj)) {
+        return responseObj.system.get_sysinfo;
+      }
+      throw new Error(`Unexpected Response: ${response}`);
+    };
+
+    if (thisSendOptions.transport === 'klap' || port === 80) {
+      const klapPort = port === 9999 ? 80 : port;
+      const response = await this.send(
+        '{"system":{"get_sysinfo":{}}}',
+        host,
+        klapPort,
+        { ...thisSendOptions, transport: 'klap' },
+      );
+      return { sysInfo: parseSysInfo(response), transport: 'klap' };
     }
 
-    throw new Error(`Unexpected Response: ${response}`);
+    try {
+      const response = await this.send(
+        '{"system":{"get_sysinfo":{}}}',
+        host,
+        port,
+        sendOptions,
+      );
+      return {
+        sysInfo: parseSysInfo(response),
+        transport: thisSendOptions.transport,
+      };
+    } catch (xorErr) {
+      const tcpRefused = isObjectLike(xorErr) && xorErr.code === 'ECONNREFUSED';
+      // UDP callers and non-refused errors should not probe HTTP 80.
+      // Firmware that closed TCP 9999 is ECONNREFUSED; that is the KLAP case.
+      if (thisSendOptions.transport === 'udp' || !tcpRefused) {
+        throw xorErr;
+      }
+      this.log.debug(
+        'client.getSysInfo(): XOR/legacy transport failed for %s:%s, trying KLAP: %s',
+        host,
+        port,
+        xorErr,
+      );
+      const response = await this.send(
+        '{"system":{"get_sysinfo":{}}}',
+        host,
+        80,
+        { ...thisSendOptions, transport: 'klap' },
+      );
+      return { sysInfo: parseSysInfo(response), transport: 'klap' };
+    }
   }
 
   /**
@@ -435,19 +550,34 @@ class Client extends EventEmitter {
   ): Promise<AnyDevice> {
     this.log.debug('client.getDevice(%j)', { deviceOptions, sendOptions });
     let sysInfo: Sysinfo;
+    let transport =
+      sendOptions?.transport ?? deviceOptions.defaultSendOptions?.transport;
+    let { port } = deviceOptions;
     if ('sysInfo' in deviceOptions && deviceOptions.sysInfo !== undefined) {
       sysInfo = deviceOptions.sysInfo;
     } else {
-      sysInfo = await this.getSysInfo(
+      const result = await this.getSysInfoWithTransport(
         deviceOptions.host,
         deviceOptions.port,
         sendOptions,
       );
+      sysInfo = result.sysInfo;
+      transport = result.transport;
+      if (result.transport === 'klap') {
+        port = port === 9999 || port == null ? 80 : port;
+      }
     }
 
     const combinedDeviceOptions = {
       ...deviceOptions,
+      port,
       client: this,
+      defaultSendOptions: {
+        ...this.defaultSendOptions,
+        ...deviceOptions.defaultSendOptions,
+        ...sendOptions,
+        ...(transport != null ? { transport } : {}),
+      },
     } as AnyDeviceOptions;
     return this.getDeviceFromSysInfo(sysInfo, combinedDeviceOptions);
   }
@@ -541,6 +671,18 @@ class Client extends EventEmitter {
       this.socket = socket;
 
       socket.on('message', (msg, rinfo) => {
+        if (isNewDiscoveryPort(rinfo.port)) {
+          void this.handleKlapDiscoveryMessage(msg, rinfo, {
+            deviceTypes,
+            macAddresses,
+            excludeMacAddresses,
+            filterCallback,
+            breakoutChildren,
+            deviceOptions,
+          });
+          return;
+        }
+
         const decryptedMsg = decrypt(msg).toString('utf8');
 
         this.log.debug(
@@ -684,6 +826,117 @@ class Client extends EventEmitter {
     return this;
   }
 
+  private hasOnlineDeviceAtHost(host: string): boolean {
+    return [...this.devices.values()].some(
+      (device) => device.host === host && device.status !== 'offline',
+    );
+  }
+
+  private async handleKlapDiscoveryMessage(
+    msg: Buffer,
+    rinfo: RemoteInfo,
+    {
+      deviceTypes,
+      macAddresses,
+      excludeMacAddresses,
+      filterCallback,
+      breakoutChildren,
+      deviceOptions,
+    }: {
+      deviceTypes?: Array<'plug' | 'bulb'>;
+      macAddresses: string[];
+      excludeMacAddresses: string[];
+      filterCallback?: (sysInfo: Sysinfo) => boolean;
+      breakoutChildren: boolean;
+      deviceOptions?: DeviceOptionsDiscovery;
+    },
+  ): Promise<void> {
+    const result = parseNewDiscoveryMessage(msg);
+    if (result == null) {
+      this.log.debug(
+        `client.startDiscovery(): unparsed KLAP discovery from ${rinfo.address}:${rinfo.port}`,
+      );
+      return;
+    }
+
+    this.log.debug(
+      `client.startDiscovery(): KLAP discovery from ${rinfo.address}:${rinfo.port} %j`,
+      result,
+    );
+
+    if (!isIotKlapDiscovery(result)) {
+      this.log.debug(
+        `client.startDiscovery(): ignoring non-IOT-KLAP device ${
+          result.device_type
+        } encrypt=${result.mgt_encrypt_schm?.encrypt_type ?? 'unknown'}`,
+      );
+      return;
+    }
+
+    if (this.hasOnlineDeviceAtHost(rinfo.address)) {
+      return;
+    }
+    if (this.pendingKlapHosts.has(rinfo.address)) {
+      return;
+    }
+
+    const mac = result.mac ?? '';
+    if (macAddresses.length > 0 && !compareMac(mac, macAddresses)) {
+      return;
+    }
+    if (
+      excludeMacAddresses.length > 0 &&
+      compareMac(mac, excludeMacAddresses)
+    ) {
+      return;
+    }
+
+    const httpPort = getKlapHttpPort(result);
+    this.pendingKlapHosts.add(rinfo.address);
+    try {
+      const { sysInfo } = await this.getSysInfoWithTransport(
+        rinfo.address,
+        httpPort,
+        {
+          transport: 'klap',
+        },
+      );
+
+      if (deviceTypes && deviceTypes.length > 0) {
+        const deviceType = this.getTypeFromSysInfo(sysInfo);
+        if (!(deviceTypes as string[]).includes(deviceType)) {
+          return;
+        }
+      }
+
+      if (typeof filterCallback === 'function' && !filterCallback(sysInfo)) {
+        return;
+      }
+
+      this.createOrUpdateDeviceFromSysInfo({
+        sysInfo,
+        host: rinfo.address,
+        port: httpPort,
+        breakoutChildren,
+        options: {
+          ...deviceOptions,
+          defaultSendOptions: {
+            ...this.defaultSendOptions,
+            ...deviceOptions?.defaultSendOptions,
+            transport: 'klap',
+          },
+        },
+      });
+    } catch (err) {
+      this.log.error(
+        `client.startDiscovery(): KLAP sysinfo failed for ${rinfo.address}: %s`,
+        err,
+      );
+    } finally {
+      this.pendingKlapHosts.delete(rinfo.address);
+    }
+  }
+
   private static setSysInfoForDevice(
     device: AnyDeviceDiscovery,
     sysInfo: Sysinfo,
@@ -803,6 +1056,22 @@ class Client extends EventEmitter {
       }
       socket.send(discoveryMsgBuf, 0, discoveryMsgBuf.length, 9999, address);
 
+      const newDiscoveryQuery = createNewDiscoveryQuery();
+      socket.send(
+        newDiscoveryQuery,
+        0,
+        newDiscoveryQuery.length,
+        DISCOVERY_PORT_2,
+        address,
+      );
+      socket.send(
+        newDiscoveryQuery,
+        0,
+        newDiscoveryQuery.length,
+        DISCOVERY_PORT_3,
+        address,
+      );
+
       devices.forEach((d) => {
         this.log.debug('client.sendDiscovery() direct device:', d);
         socket.send(
@@ -810,6 +1079,20 @@ class Client extends EventEmitter {
           0,
           discoveryMsgBuf.length,
           d.port || 9999,
+          d.host,
+        );
+        socket.send(
+          newDiscoveryQuery,
+          0,
+          newDiscoveryQuery.length,
+          DISCOVERY_PORT_2,
+          d.host,
+        );
+        socket.send(
+          newDiscoveryQuery,
+          0,
+          newDiscoveryQuery.length,
+          DISCOVERY_PORT_3,
           d.host,
         );
       });

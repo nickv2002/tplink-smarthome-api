@@ -86,4 +86,7 @@ export type { default as Time } from './shared/time';
 
 export type { LogLevelMethodNames, Logger } from './logger';
 
+export type { Credentials } from './network/klap';
+export { AuthenticationError } from './network/klap-connection';
+
 export { ResponseError, type HasErrCode } from './utils';

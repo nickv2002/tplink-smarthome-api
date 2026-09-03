@@ -1,14 +1,14 @@
 <!-- markdownlint-disable MD007 MD012 MD033 -->
 
-# tplink-smarthome-api
+# @steveglenner/tplink-smarthome-api
 
-[![NPM Version](https://img.shields.io/npm/v/tplink-smarthome-api.svg)](https://www.npmjs.com/package/tplink-smarthome-api)
-[![Build Status](https://github.com/plasticrake/tplink-smarthome-api/workflows/CI/badge.svg?branch=main)](https://github.com/plasticrake/tplink-smarthome-api/actions?query=workflow%3ACI+branch%3Amain)
-[![Coverage Status](https://coveralls.io/repos/github/plasticrake/tplink-smarthome-api/badge.svg?branch=master)](https://coveralls.io/github/plasticrake/tplink-smarthome-api?branch=master)
+Fork of [plasticrake/tplink-smarthome-api](https://github.com/plasticrake/tplink-smarthome-api) with KLAP v1/v2 support for firmware that closed TCP 9999 (for example KL125 1.1.1).
+
+[![NPM Version](https://img.shields.io/npm/v/@steveglenner/tplink-smarthome-api.svg)](https://www.npmjs.com/package/@steveglenner/tplink-smarthome-api)
 
 TP-Link Smarthome API
 
-**[Changelog](https://github.com/plasticrake/tplink-smarthome-api/tree/main/CHANGELOG.md)**
+**[Changelog](CHANGELOG.md)**
 
 ## Known Supported Devices
 
@@ -24,16 +24,22 @@ Many other TP-Link Plug and Bulb models may work as well. Note that Tapo devices
 
 - [TP-Link Smarthome Device Simulator](https://github.com/plasticrake/tplink-smarthome-simulator) - Useful for automated testing
 - [TP-Link Smarthome Crypto](https://github.com/plasticrake/tplink-smarthome-crypto)
-- [TP-Link Smarthome Homebridge Plugin](https://github.com/plasticrake/homebridge-tplink-smarthome)
+- [TP-Link Smarthome Homebridge Plugin (original)](https://github.com/plasticrake/homebridge-tplink-smarthome)
+- [homebridge-tplink-smarthome-klap2](https://github.com/scratchdiver/homebridge-tplink-smarthome-klap2) - this fork's Homebridge plugin
 
 ## Examples
 
-See more [examples](https://github.com/plasticrake/tplink-smarthome-api/tree/main/examples).
+See more [examples](examples).
 
 ```javascript
-const { Client } = require('tplink-smarthome-api');
+const { Client } = require('@steveglenner/tplink-smarthome-api');
 
-const client = new Client();
+const client = new Client({
+  defaultSendOptions: { timeout: 15000 },
+  // Required for KLAP firmware (Kasa email/password):
+  // username: 'you@example.com',
+  // password: 'your-kasa-password',
+});
 const plug = client.getDevice({ host: '10.0.1.2' }).then((device) => {
   device.getSysInfo().then(console.log);
   device.setPowerState(true);
@@ -48,7 +54,9 @@ client.startDiscovery().on('device-new', (device) => {
 
 ## CLI
 
-Install the command line utility with `npm install -g tplink-smarthome-api`. Run `tplink-smarthome-api --help` for help.
+Install the command line utility with `npm install -g @steveglenner/tplink-smarthome-api`. Run `tplink-smarthome-api --help` for help.
+
+Pass `--username` and `--password` (Kasa account) when talking to devices that use KLAP.
 
 ## API
 

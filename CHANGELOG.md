@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file. See [commit-and-tag-version](https://github.com/absolute-version/commit-and-tag-version) for commit guidelines.
 
+## [5.1.0](https://github.com/scratchdiver/tplink-smarthome-api/compare/v5.0.0...v5.1.0) (2026-09-03)
+
+Fork of plasticrake/tplink-smarthome-api published as `@steveglenner/tplink-smarthome-api`.
+
+### Features
+
+* add KLAP v1/v2 HTTP transport for devices that closed TCP 9999
+* Client `username` / `password` for Kasa cloud credentials used in KLAP handshake
+* UDP 20002/20004 discovery for IOT devices advertising `encrypt_type=KLAP`
+
 ## [5.0.0](https://github.com/plasticrake/tplink-smarthome-api/compare/v4.2.0...v5.0.0) (2023-11-15)
 
 

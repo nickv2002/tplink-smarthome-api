@@ -24,6 +24,14 @@ const program = new Command()
   .option('-t, --timeout <ms>', 'timeout (ms)', toInt, 10000)
   .option('-u, --udp', 'send via UDP')
   .option(
+    '--username <username>',
+    'TP-Link cloud account email (required for KLAP devices)',
+  )
+  .option(
+    '--password <password>',
+    'TP-Link cloud account password (required for KLAP devices)',
+  )
+  .option(
     '-c, --color [on]',
     'output will be styled with ANSI color codes',
     'on',
@@ -44,7 +52,12 @@ function getClient(): Client {
   const options = program.opts();
   if (options.udp) defaultSendOptions.transport = 'udp';
   if (options.timeout) defaultSendOptions.timeout = options.timeout;
-  return new Client({ logLevel, defaultSendOptions });
+  return new Client({
+    logLevel,
+    defaultSendOptions,
+    username: options.username,
+    password: options.password,
+  });
 }
 
 function search(
