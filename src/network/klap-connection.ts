@@ -271,6 +271,38 @@ export default class KlapConnection {
     this.log.debug(`KlapConnection(${this.description}): handshake complete`);
   }
 
+  private async sendRequest(
+    payload: string,
+    timeout: number,
+  ): Promise<{ status: number; seq: number; text?: string }> {
+    const session = this.encryptionSession;
+    if (session == null) {
+      throw new Error(
+        `KLAP handshake did not establish a session with ${this.host}`,
+      );
+    }
+
+    const { payload: encrypted, seq } = session.encrypt(payload);
+    const response = await httpPost(`${this.appUrl}/request`, {
+      body: encrypted,
+      cookies: this.sessionCookie,
+      timeout,
+      params: { seq },
+    });
+
+    if (response.status !== 200) {
+      return { status: response.status, seq };
+    }
+
+    try {
+      return { status: 200, seq, text: session.decrypt(response.body) };
+    } catch (err) {
+      throw new Error(
+        `Error trying to decrypt device ${this.host} response: ${String(err)}`,
+      );
+    }
+  }
+
   async send(
     payload: string,
     port: number,
@@ -281,43 +313,36 @@ export default class KlapConnection {
     this.host = host;
 
     return this.queue.add(async () => {
+      let freshSession = false;
       if (!this.handshakeDone || this.handshakeSessionExpired()) {
         await this.performHandshake(timeout);
+        freshSession = true;
       }
 
-      const session = this.encryptionSession;
-      if (session == null) {
-        throw new Error(
-          `KLAP handshake did not establish a session with ${this.host}`,
-        );
-      }
+      let result = await this.sendRequest(payload, timeout);
 
-      const { payload: encrypted, seq } = session.encrypt(payload);
-      const response = await httpPost(`${this.appUrl}/request`, {
-        body: encrypted,
-        cookies: this.sessionCookie,
-        timeout,
-        params: { seq },
-      });
-
-      if (response.status !== 200) {
-        if (response.status === 403) {
-          this.handshakeDone = false;
+      if (result.status === 403) {
+        this.handshakeDone = false;
+        if (!freshSession) {
+          // The device dropped our session before our own expiry estimate
+          // (a recoverable condition). Re-handshake and resend once.
+          this.log.debug(
+            `KlapConnection(${this.description}): 403 on existing session, re-handshaking and retrying`,
+          );
+          await this.performHandshake(timeout);
+          result = await this.sendRequest(payload, timeout);
+          if (result.status === 403) {
+            this.handshakeDone = false;
+          }
         }
-        throw new Error(
-          `Device ${this.host} responded with ${response.status} to request with seq ${seq}`,
-        );
       }
 
-      try {
-        return session.decrypt(response.body);
-      } catch (err) {
+      if (result.text == null) {
         throw new Error(
-          `Error trying to decrypt device ${this.host} response: ${String(
-            err,
-          )}`,
+          `Device ${this.host} responded with ${result.status} to request with seq ${result.seq}`,
         );
       }
+      return result.text;
     });
   }
 }
